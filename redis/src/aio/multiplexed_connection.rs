@@ -212,83 +212,101 @@ where
             _ => result,
         };
 
-        let mut entry = match self_.in_flight.pop_front() {
-            Some(entry) => entry,
-            None => return,
+        // A single-command reply always completes its entry, so remove it and
+        // deliver directly.
+        if matches!(
+            self_.in_flight.front().map(|e| &e.response_aggregate),
+            Some(ResponseAggregate::SingleCommand)
+        ) {
+            let mut entry = self_.in_flight.pop_front().unwrap();
+            if let Some(output) = entry.output.take() {
+                _ = output.send(result);
+            }
+            return;
+        }
+
+        // Pipeline aggregate: fold this response into the front entry *in place*.
+        // Previously each of the N responses popped the entry off the queue and
+        // pushed it back on; instead mutate it through `front_mut` and only remove
+        // it once every expected response has arrived.
+        let Some(entry) = self_.in_flight.front_mut() else {
+            return;
+        };
+        let ResponseAggregate::Pipeline {
+            buffer,
+            error_or_errors,
+            expectation:
+                PipelineResponseExpectation {
+                    expected_response_count,
+                    skipped_response_count,
+                    is_transaction,
+                    seen_responses,
+                },
+        } = &mut entry.response_aggregate
+        else {
+            return;
         };
 
-        match &mut entry.response_aggregate {
-            ResponseAggregate::SingleCommand => {
-                if let Some(output) = entry.output.take() {
-                    _ = output.send(result);
-                }
-            }
-            ResponseAggregate::Pipeline {
-                buffer,
-                error_or_errors,
-                expectation:
-                    PipelineResponseExpectation {
-                        expected_response_count,
-                        skipped_response_count,
-                        is_transaction,
-                        seen_responses,
-                    },
-            } => {
-                *seen_responses += 1;
-                if *skipped_response_count > 0 {
-                    // server errors in skipped values are still counted for errors in transactions, since they're errors that will cause the transaction to fail,
-                    // and we only skip values in transaction.
-                    if *is_transaction && let ErrorOrErrors::Errors(errs) = error_or_errors {
-                        match result {
-                            Ok(Value::ServerError(err)) => {
-                                errs.push((*seen_responses - 2, err)); // - 1 to offset the early increment, and -1 to offset the added MULTI call.
-                            }
-                            Err(err) => *error_or_errors = ErrorOrErrors::FirstError(err),
-                            _ => {}
-                        }
-                    }
-
-                    *skipped_response_count -= 1;
-                    self_.in_flight.push_front(entry);
-                    return;
-                }
-
+        *seen_responses += 1;
+        if *skipped_response_count > 0 {
+            // server errors in skipped values are still counted for errors in transactions, since they're errors that will cause the transaction to fail,
+            // and we only skip values in transaction.
+            if *is_transaction && let ErrorOrErrors::Errors(errs) = error_or_errors {
                 match result {
-                    Ok(item) => {
-                        buffer.push(item);
+                    Ok(Value::ServerError(err)) => {
+                        errs.push((*seen_responses - 2, err)); // - 1 to offset the early increment, and -1 to offset the added MULTI call.
                     }
-                    Err(err) => {
-                        if matches!(error_or_errors, ErrorOrErrors::Errors(_)) {
-                            *error_or_errors = ErrorOrErrors::FirstError(err)
-                        }
-                    }
-                }
-
-                if buffer.len() < *expected_response_count {
-                    // Need to gather more response values
-                    self_.in_flight.push_front(entry);
-                    return;
-                }
-
-                let response =
-                    match std::mem::replace(error_or_errors, ErrorOrErrors::Errors(Vec::new())) {
-                        ErrorOrErrors::Errors(errors) => {
-                            if errors.is_empty() {
-                                Ok(Value::Array(std::mem::take(buffer)))
-                            } else {
-                                Err(RedisError::make_aborted_transaction(errors))
-                            }
-                        }
-                        ErrorOrErrors::FirstError(redis_error) => Err(redis_error),
-                    };
-
-                // `Err` means that the receiver was dropped in which case it does not
-                // care about the output and we can continue by just dropping the value
-                // and sender
-                if let Some(output) = entry.output.take() {
-                    _ = output.send(response);
+                    Err(err) => *error_or_errors = ErrorOrErrors::FirstError(err),
+                    _ => {}
                 }
             }
+
+            *skipped_response_count -= 1;
+            return;
+        }
+
+        match result {
+            Ok(item) => {
+                buffer.push(item);
+            }
+            Err(err) => {
+                if matches!(error_or_errors, ErrorOrErrors::Errors(_)) {
+                    *error_or_errors = ErrorOrErrors::FirstError(err)
+                }
+            }
+        }
+
+        if buffer.len() < *expected_response_count {
+            // Need to gather more response values; keep the entry in place.
+            return;
+        }
+
+        // All responses gathered — remove the entry and deliver the aggregate.
+        let mut entry = self_.in_flight.pop_front().unwrap();
+        let ResponseAggregate::Pipeline {
+            buffer,
+            error_or_errors,
+            ..
+        } = &mut entry.response_aggregate
+        else {
+            return;
+        };
+        let response = match std::mem::replace(error_or_errors, ErrorOrErrors::Errors(Vec::new())) {
+            ErrorOrErrors::Errors(errors) => {
+                if errors.is_empty() {
+                    Ok(Value::Array(std::mem::take(buffer)))
+                } else {
+                    Err(RedisError::make_aborted_transaction(errors))
+                }
+            }
+            ErrorOrErrors::FirstError(redis_error) => Err(redis_error),
+        };
+
+        // `Err` means that the receiver was dropped in which case it does not
+        // care about the output and we can continue by just dropping the value
+        // and sender
+        if let Some(output) = entry.output.take() {
+            _ = output.send(response);
         }
     }
 }

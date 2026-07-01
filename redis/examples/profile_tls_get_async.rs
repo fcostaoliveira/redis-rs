@@ -56,7 +56,9 @@ fn main() {
         .build()
         .expect("start pprof");
 
-    eprintln!("profiling ASYNC TLS pipelined GET: size={size}B pipeline={pipeline} for {secs}s ...");
+    eprintln!(
+        "profiling ASYNC TLS pipelined GET: size={size}B pipeline={pipeline} for {secs}s ..."
+    );
     let deadline = Instant::now() + Duration::from_secs(secs);
     let mut iters: u64 = 0;
     runtime.block_on(async {
@@ -66,7 +68,10 @@ fn main() {
             iters += 1;
         }
     });
-    eprintln!("done: {iters} pipeline iters ({} GETs)", iters * pipeline as u64);
+    eprintln!(
+        "done: {iters} pipeline iters ({} GETs)",
+        iters * pipeline as u64
+    );
 
     let report = guard.report().build().expect("build report");
     let out = format!("flamegraph-async-tls-get-{size}.svg");
