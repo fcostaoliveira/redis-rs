@@ -272,6 +272,18 @@ fn bench_decode(c: &mut Criterion) {
         assert_eq!(redis::parse_redis_value(&input).unwrap(), value);
         group.bench_function("decode", move |b| bench_decode_simple(b, &input));
     }
+    // A RESP3 map reply (e.g. HGETALL / CONFIG GET in RESP3): 32 string->int
+    // entries, plus a double and a boolean — the RESP3 types a client meets often.
+    {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"%34\r\n");
+        for i in 0..32 {
+            input.extend_from_slice(format!("$7\r\nfield{i:02}\r\n:{i}\r\n").as_bytes());
+        }
+        input.extend_from_slice(b"+score\r\n,3.14159\r\n+ok\r\n#t\r\n");
+        assert!(redis::parse_redis_value(&input).is_ok());
+        group.bench_function("decode_resp3_map", move |b| bench_decode_simple(b, &input));
+    }
     group.finish();
 }
 
