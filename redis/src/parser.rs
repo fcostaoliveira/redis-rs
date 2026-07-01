@@ -225,18 +225,22 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             Some((Value::Set(items), cur))
         }
         b'%' => {
-            // RESP3 map — `kv_length` pairs, i.e. 2*kv_length flat values.
+            // RESP3 map — `kv_length` (key, value) pairs.
             let (line, np) = read_line(buf, body)?;
             let s = str::from_utf8(line).ok()?;
             let kv_length = s.trim().parse::<i64>().ok()?;
-            // Match combine: cast to usize (wrapping for negatives) then *2 with
-            // overflow check; on overflow combine errors, so we decline.
-            let length = (kv_length as usize).checked_mul(2)?;
-            let (flat, cur) = fast_parse_seq(buf, np, length, depth)?;
-            let mut it = flat.into_iter();
-            let mut pairs = Vec::with_capacity(it.len() / 2);
-            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+            // Match combine: cast to usize (wrapping for negatives); combine
+            // errors when kv_length*2 overflows, so decline on the same overflow.
+            let kv_length = kv_length as usize;
+            kv_length.checked_mul(2)?; // decline (→ combine errors) on the same overflow
+            // Build pairs directly rather than a flat Vec we then re-partition.
+            let mut pairs = Vec::with_capacity(kv_length.min(1024));
+            let mut cur = np;
+            for _ in 0..kv_length {
+                let (k, next) = fast_parse_at(buf, cur, depth + 1)?;
+                let (v, next) = fast_parse_at(buf, next, depth + 1)?;
                 pairs.push((k, v));
+                cur = next;
             }
             Some((Value::Map(pairs), cur))
         }
