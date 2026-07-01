@@ -549,6 +549,29 @@ impl Value {
         Ok(vec)
     }
 
+    /// Recursively find the first `ServerError` in the value tree, by reference.
+    ///
+    /// This is the allocation-free counterpart to [`extract_error`](Self::extract_error):
+    /// it walks the same structure but neither consumes nor rebuilds the value, so it
+    /// can validate an already-decoded value without moving it. `extract_error` errors
+    /// on the first `ServerError` it meets; this returns that same error by reference.
+    pub(crate) fn as_server_error(&self) -> Option<&ServerError> {
+        match self {
+            Self::ServerError(err) => Some(err),
+            Self::Array(items) | Self::Set(items) => items.iter().find_map(Self::as_server_error),
+            Self::Push { data, .. } => data.iter().find_map(Self::as_server_error),
+            Self::Map(map) => map
+                .iter()
+                .find_map(|(k, v)| k.as_server_error().or_else(|| v.as_server_error())),
+            Self::Attribute { data, attributes } => data.as_server_error().or_else(|| {
+                attributes
+                    .iter()
+                    .find_map(|(k, v)| k.as_server_error().or_else(|| v.as_server_error()))
+            }),
+            _ => None,
+        }
+    }
+
     fn is_collection_of_len(&self, len: usize) -> bool {
         match self {
             Value::Array(values) => values.len() == len,

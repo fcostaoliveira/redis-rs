@@ -389,9 +389,13 @@ macro_rules! implement_pipeline_commands {
                     .collect();
 
                 if server_errors.is_empty() {
-                    Ok(from_redis_value(
-                        Value::Array(self.filter_ignored_results(response)).extract_error()?,
-                    )?)
+                    let filtered = self.filter_ignored_results(response);
+                    // No top-level errors; check for nested ones by reference
+                    // instead of rebuilding the whole Vec via `extract_error`.
+                    if let Some(err) = filtered.iter().find_map(Value::as_server_error) {
+                        return Err(err.clone().into());
+                    }
+                    Ok(from_redis_value(Value::Array(filtered))?)
                 } else {
                     Err(crate::RedisError::pipeline(server_errors))
                 }
@@ -452,6 +456,40 @@ mod tests {
             kind: ServerErrorKind::CrossSlot,
             detail: None,
         }))
+    }
+
+    /// `as_server_error` (by-reference, used by `compose_response`) must agree
+    /// with `extract_error` (owned) on whether a value tree contains a
+    /// `ServerError`, including nested ones — that's the invariant that lets the
+    /// hot path skip the `extract_error` rebuild.
+    #[test]
+    fn as_server_error_agrees_with_extract_error() {
+        let ok = || Value::Okay;
+        let e = server_error;
+        let cases = vec![
+            Value::Int(1),
+            ok(),
+            e(),
+            Value::Array(vec![ok(), Value::Int(2)]),
+            Value::Array(vec![ok(), e(), ok()]), // nested error
+            Value::Array(vec![Value::Array(vec![e()])]), // deeply nested
+            Value::Set(vec![ok(), e()]),
+            Value::Map(vec![(ok(), e())]),
+            Value::Map(vec![(e(), ok())]),
+            Value::Push {
+                kind: crate::PushKind::Message,
+                data: vec![ok(), e()],
+            },
+            Value::Attribute {
+                data: Box::new(ok()),
+                attributes: vec![(ok(), e())],
+            },
+        ];
+        for v in cases {
+            let by_ref = v.as_server_error().is_some();
+            let by_owned = v.clone().extract_error().is_err();
+            assert_eq!(by_ref, by_owned, "disagreement on {v:?}");
+        }
     }
 
     #[test]
