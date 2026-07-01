@@ -674,7 +674,6 @@ mod tests {
 
     impl quickcheck::Arbitrary for RespishBytes {
         fn arbitrary(g: &mut quickcheck::Gen) -> Self {
-            use quickcheck::Arbitrary;
             const MARKERS: &[u8] = b"+-:$*_%~,#!=(>";
             let mut out = Vec::new();
             let lines = (usize::arbitrary(g) % 4) + 1;
