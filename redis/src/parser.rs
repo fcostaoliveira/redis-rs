@@ -77,15 +77,14 @@ pub fn get_push_kind(kind: String) -> PushKind {
 // but for the overwhelmingly common case — a *complete* reply already sitting
 // in the buffer — it is pure overhead.
 //
-// `fast_parse_value` decodes one complete RESP value directly from a byte
-// slice for all the common types (`+ - : $ * _ % ~ , # ! = >`). It returns
-// `Some((value, consumed))` ONLY when it fully parses a supported, well-formed
-// value with semantics identical to the `combine` grammar below. For anything
-// else — an incomplete buffer, a still-unsupported RESP3 type (big number `(`,
-// attribute `|`), or malformed input — it returns `None`, and the caller falls back to the
-// `combine` parser, which remains the single source of truth for correctness
-// and error reporting. This keeps the fast path a pure accelerator that can
-// only ever agree with `combine`, never diverge from it.
+// `fast_parse_value` decodes one complete RESP value directly from a byte slice
+// for the whole RESP2/RESP3 grammar. It returns `Some((value, consumed))` ONLY
+// when it fully parses a well-formed value with semantics identical to the
+// `combine` grammar below. For an incomplete buffer or malformed input it
+// returns `None`, and the caller falls back to the `combine` parser, which
+// remains the single source of truth for correctness and error reporting. This
+// keeps the fast path a pure accelerator that can only ever agree with
+// `combine`, never diverge from it.
 
 /// Index of the `\r` of the first `\r\n` at or after `from`, or `None` if the
 /// buffer does not yet contain a line terminator.
@@ -143,6 +142,19 @@ fn fast_parse_blob(buf: &[u8], pos: usize) -> Option<(String, usize)> {
         return None;
     }
     Some((String::from_utf8_lossy(&buf[np..end]).into_owned(), end + 2))
+}
+
+/// Decode a RESP3 big number line (`(<digits>`), matching combine's feature-gated
+/// behavior: with `num-bigint` the digits are parsed (declining on garbage, which
+/// combine rejects); without it the raw bytes are stored.
+#[cfg(not(feature = "num-bigint"))]
+fn fast_parse_big_number(s: &str, np: usize) -> Option<(Value, usize)> {
+    Some((Value::BigNumber(s.as_bytes().to_vec()), np))
+}
+#[cfg(feature = "num-bigint")]
+fn fast_parse_big_number(s: &str, np: usize) -> Option<(Value, usize)> {
+    let n = num_bigint::BigInt::parse_bytes(s.as_bytes(), 10)?;
+    Some((Value::BigNumber(n), np))
 }
 
 /// Parse one RESP value from `buf` starting at `pos`. Returns `(value, new_pos)`
@@ -315,7 +327,38 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
                 cur,
             ))
         }
-        _ => None, // unsupported RESP3 type → fall back to combine
+        b'(' => {
+            // RESP3 big number.
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            fast_parse_big_number(s, np)
+        }
+        b'|' => {
+            // RESP3 attribute — `kv_length` metadata pairs followed by 1 data value.
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let kv_length = s.trim().parse::<i64>().ok()?;
+            let kv_length = kv_length as usize;
+            // combine: 2*kv_length values for the pairs, +1 for the data.
+            let length = kv_length.checked_mul(2)?.checked_add(1)?;
+            let (items, cur) = fast_parse_seq(buf, np, length, depth)?;
+            let mut it = items.into_iter();
+            let mut attributes = Vec::with_capacity(kv_length.min(1024));
+            for _ in 0..kv_length {
+                let k = it.next()?;
+                let v = it.next()?;
+                attributes.push((k, v));
+            }
+            let data = it.next()?; // the trailing data element
+            Some((
+                Value::Attribute {
+                    data: Box::new(data),
+                    attributes,
+                },
+                cur,
+            ))
+        }
+        _ => None, // unreachable for well-formed RESP; malformed input declines here
     }
 }
 
@@ -874,6 +917,9 @@ mod tests {
             b"=8\r\nmkd:# hi\r\n",
             b">3\r\n$7\r\nmessage\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", // push
             b">0\r\n",                                            // empty push
+            b"(3492890328409238509324850943850943825024385\r\n",  // big number
+            b"|1\r\n+ttl\r\n:3600\r\n:42\r\n",                    // attribute (1 pair + data)
+            b"|0\r\n+justdata\r\n",                               // attribute, no pairs
         ];
         for input in supported {
             let fast = fast_parse_value(input).map(|(v, _)| v);
@@ -883,24 +929,6 @@ mod tests {
                 "fast path disagrees with combine on {input:?}"
             );
             assert!(fast.is_some(), "fast path should handle {input:?}");
-        }
-
-        // Still-unsupported RESP3 types: the fast path must decline so combine
-        // parses them (and still produce the same value via parse_redis_value).
-        let deferred: &[&[u8]] = &[
-            b"(12345\r\n",               // big number
-            b"|1\r\n+k\r\n+v\r\n:1\r\n", // attribute
-        ];
-        for input in deferred {
-            assert!(
-                fast_parse_value(input).is_none(),
-                "fast path should decline unsupported type {input:?}"
-            );
-            // parse_redis_value must still succeed (via the combine fallback).
-            assert!(
-                parse_redis_value(input).is_ok(),
-                "combine fallback for {input:?}"
-            );
         }
 
         // Incomplete buffers: the fast path must decline (return None), leaving
