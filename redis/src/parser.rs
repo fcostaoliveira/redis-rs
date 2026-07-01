@@ -495,11 +495,11 @@ mod aio_support {
         fn decode_stream(&mut self, bytes: &mut BytesMut, eof: bool) -> RedisResult<Option<Value>> {
             // Fast path: only safe when combine is not mid-parse. It consumes
             // exactly one complete value; Framed will call us again for the next.
-            if !self.partial {
-                if let Some((value, consumed)) = fast_parse_value(&bytes[..]) {
-                    bytes.advance(consumed);
-                    return Ok(Some(value));
-                }
+            if !self.partial
+                && let Some((value, consumed)) = fast_parse_value(&bytes[..])
+            {
+                bytes.advance(consumed);
+                return Ok(Some(value));
             }
             let (opt, removed_len) = {
                 let buffer = &bytes[..];
@@ -638,6 +638,73 @@ mod tests {
     use super::*;
     use crate::errors::ErrorKind;
     use assert_matches::assert_matches;
+
+    /// EXP-001: the fast path must agree with the `combine` grammar on every
+    /// input it claims (`Some`), and must decline (`None`) unsupported RESP3
+    /// types so `combine` handles them. Guards against the fast path silently
+    /// diverging from the canonical parser.
+    #[test]
+    fn fast_path_matches_combine() {
+        // Supported types + edge cases: the fast path must fully parse these
+        // and agree with the combine reference.
+        let supported: &[&[u8]] = &[
+            b"+OK\r\n",
+            b"+hello world\r\n",
+            b"-ERR bad\r\n",
+            b"-MOVED 1234 127.0.0.1:6379\r\n",
+            b":12345\r\n",
+            b":-9\r\n",
+            b"$5\r\nhello\r\n",
+            b"$0\r\n\r\n",
+            b"$-1\r\n",
+            b"_\r\n",
+            b"*3\r\n$3\r\nfoo\r\n:1\r\n+OK\r\n",
+            b"*-1\r\n",
+            b"*0\r\n",
+            b"*2\r\n*1\r\n:1\r\n$1\r\na\r\n",
+        ];
+        for input in supported {
+            let fast = fast_parse_value(input).map(|(v, _)| v);
+            let reference = Parser::new().parse_value(*input).ok();
+            assert_eq!(
+                fast, reference,
+                "fast path disagrees with combine on {input:?}"
+            );
+            assert!(fast.is_some(), "fast path should handle {input:?}");
+        }
+
+        // Unsupported RESP3 types: the fast path must decline so combine parses
+        // them (and still produce the same value via parse_redis_value).
+        let deferred: &[&[u8]] = &[
+            b"%1\r\n+a\r\n:1\r\n",
+            b"~2\r\n:1\r\n:2\r\n",
+            b",3.14\r\n",
+            b"#t\r\n",
+            b"(12345\r\n",
+            b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n",
+        ];
+        for input in deferred {
+            assert!(
+                fast_parse_value(input).is_none(),
+                "fast path should decline unsupported type {input:?}"
+            );
+            // parse_redis_value must still succeed (via the combine fallback).
+            assert!(
+                parse_redis_value(input).is_ok(),
+                "combine fallback for {input:?}"
+            );
+        }
+
+        // Incomplete buffers: the fast path must decline (return None), leaving
+        // the caller to wait for / fall back for more bytes.
+        let incomplete: &[&[u8]] = &[b"$5\r\nhel", b"*2\r\n:1\r\n", b"+OK\r", b":12"];
+        for input in incomplete {
+            assert!(
+                fast_parse_value(input).is_none(),
+                "fast path should decline incomplete {input:?}"
+            );
+        }
+    }
 
     #[cfg(feature = "aio")]
     #[test]

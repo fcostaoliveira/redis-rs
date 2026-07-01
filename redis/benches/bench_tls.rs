@@ -54,7 +54,11 @@ fn tls_ctx() -> TestContext {
 fn bench_sync_get(b: &mut Bencher, ctx: &TestContext, value: &[u8]) {
     let mut con = ctx.connection();
     let key = "bench_tls_key";
-    redis::cmd("SET").arg(key).arg(value).exec(&mut con).unwrap();
+    redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .exec(&mut con)
+        .unwrap();
 
     b.iter(|| {
         let v: Vec<u8> = redis::cmd("GET").arg(key).query(&mut con).unwrap();
@@ -108,7 +112,11 @@ const PIPELINE_GETS: usize = 1_000;
 fn bench_sync_pipeline_get(b: &mut Bencher, ctx: &TestContext, value: &[u8]) {
     let mut con = ctx.connection();
     let key = "bench_tls_key";
-    redis::cmd("SET").arg(key).arg(value).exec(&mut con).unwrap();
+    redis::cmd("SET")
+        .arg(key)
+        .arg(value)
+        .exec(&mut con)
+        .unwrap();
 
     let mut pipe = redis::pipe();
     for _ in 0..PIPELINE_GETS {

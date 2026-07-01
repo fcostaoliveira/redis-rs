@@ -37,7 +37,11 @@ fn main() {
 
     let key = "prof_tls_key";
     let value = vec![b'x'; size];
-    redis::cmd("SET").arg(key).arg(&value).exec(&mut con).unwrap();
+    redis::cmd("SET")
+        .arg(key)
+        .arg(&value)
+        .exec(&mut con)
+        .unwrap();
 
     let mut pipe = redis::pipe();
     for _ in 0..pipeline {
