@@ -68,6 +68,135 @@ pub fn get_push_kind(kind: String) -> PushKind {
     }
 }
 
+// ---------------------------------------------------------------------------
+// EXP-001: hand-written RESP fast-path decoder.
+//
+// The profile (experiments/EXP-000-baseline/PROFILE.md) showed ~60% of the
+// client CPU is spent inside `combine`'s partial-state parser-combinator
+// machinery. That machinery exists to resume a parse across a buffer boundary,
+// but for the overwhelmingly common case — a *complete* reply already sitting
+// in the buffer — it is pure overhead.
+//
+// `fast_parse_value` decodes one complete RESP value directly from a byte
+// slice for the high-frequency types (`+ - : $ * _`). It returns
+// `Some((value, consumed))` ONLY when it fully parses a supported, well-formed
+// value with semantics identical to the `combine` grammar below. For anything
+// else — an incomplete buffer, an unsupported RESP3 type (`% ~ | , # ! = ( >`),
+// or malformed input — it returns `None`, and the caller falls back to the
+// `combine` parser, which remains the single source of truth for correctness
+// and error reporting. This keeps the fast path a pure accelerator that can
+// only ever agree with `combine`, never diverge from it.
+
+/// Index of the `\r` of the first `\r\n` at or after `from`, or `None` if the
+/// buffer does not yet contain a line terminator.
+#[inline]
+fn find_crlf(buf: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while let Some(off) = buf[i..].iter().position(|&b| b == b'\r') {
+        let cr = i + off;
+        match buf.get(cr + 1) {
+            Some(b'\n') => return Some(cr),
+            Some(_) => i = cr + 1,
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Read a `\r\n`-terminated line starting at `pos`. Returns the content (without
+/// the terminator) and the position just past the `\r\n`.
+#[inline]
+fn read_line(buf: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+    let cr = find_crlf(buf, pos)?;
+    Some((&buf[pos..cr], cr + 2))
+}
+
+/// Parse one RESP value from `buf` starting at `pos`. Returns `(value, new_pos)`
+/// on success. `depth` guards against unbounded recursion, matching the
+/// `combine` grammar's `MAX_RECURSE_DEPTH` behavior (fall back on excess).
+fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)> {
+    if depth > MAX_RECURSE_DEPTH {
+        return None;
+    }
+    let marker = *buf.get(pos)?;
+    let body = pos + 1;
+    match marker {
+        b'+' => {
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let v = if s == "OK" {
+                Value::Okay
+            } else {
+                Value::SimpleString(s.into())
+            };
+            Some((v, np))
+        }
+        b'-' => {
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            Some((Value::ServerError(err_parser(s)), np))
+        }
+        b':' => {
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let n = s.trim().parse::<i64>().ok()?;
+            Some((Value::Int(n), np))
+        }
+        b'_' => {
+            // RESP3 null: content is ignored, only the line terminator matters.
+            let (_line, np) = read_line(buf, body)?;
+            Some((Value::Nil, np))
+        }
+        b'$' => {
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let size = s.trim().parse::<i64>().ok()?;
+            if size < 0 {
+                return Some((Value::Nil, np));
+            }
+            let size = size as usize;
+            let end = np.checked_add(size)?;
+            // Need the payload plus its trailing CRLF.
+            if end + 2 > buf.len() {
+                return None;
+            }
+            if &buf[end..end + 2] != b"\r\n" {
+                return None; // malformed → let combine report it
+            }
+            Some((Value::BulkString(buf[np..end].to_vec()), end + 2))
+        }
+        b'*' => {
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let len = s.trim().parse::<i64>().ok()?;
+            if len < 0 {
+                return Some((Value::Nil, np));
+            }
+            let len = len as usize;
+            // Cap the pre-allocation so a bogus length can't trigger a huge
+            // up-front allocation; the real bound is the buffer contents.
+            let mut out = Vec::with_capacity(len.min(1024));
+            let mut cur = np;
+            for _ in 0..len {
+                let (v, next) = fast_parse_at(buf, cur, depth + 1)?;
+                out.push(v);
+                cur = next;
+            }
+            Some((Value::Array(out), cur))
+        }
+        _ => None, // unsupported RESP3 type → fall back to combine
+    }
+}
+
+/// Fast-path entry point: decode one complete supported RESP value from the
+/// start of `buf`. See the module note above for the contract.
+#[inline]
+fn fast_parse_value(buf: &[u8]) -> Option<(Value, usize)> {
+    // Start at depth 1 to match the `combine` grammar, whose recursion `count`
+    // starts at 1 and errors when it exceeds MAX_RECURSE_DEPTH.
+    fast_parse_at(buf, 0, 1)
+}
+
 fn value<'a, I>(
     count: Option<usize>,
 ) -> impl combine::Parser<I, Output = Value, PartialState = AnySendSyncPartialState>
@@ -355,10 +484,23 @@ mod aio_support {
     #[derive(Default)]
     pub struct ValueCodec {
         state: AnySendSyncPartialState,
+        // EXP-001: true while `combine` holds partial state from an earlier
+        // incomplete decode. The fast path is only tried when this is false, so
+        // a fast-path success can never be interleaved into a `combine`
+        // resume-across-reads sequence (which would strand `state`).
+        partial: bool,
     }
 
     impl ValueCodec {
         fn decode_stream(&mut self, bytes: &mut BytesMut, eof: bool) -> RedisResult<Option<Value>> {
+            // Fast path: only safe when combine is not mid-parse. It consumes
+            // exactly one complete value; Framed will call us again for the next.
+            if !self.partial {
+                if let Some((value, consumed)) = fast_parse_value(&bytes[..]) {
+                    bytes.advance(consumed);
+                    return Ok(Some(value));
+                }
+            }
             let (opt, removed_len) = {
                 let buffer = &bytes[..];
                 let mut stream =
@@ -377,8 +519,18 @@ mod aio_support {
 
             bytes.advance(removed_len);
             match opt {
-                Some(result) => Ok(Some(result)),
-                None => Ok(None),
+                Some(result) => {
+                    // combine finished a value; its partial state is reset, so
+                    // the fast path is eligible again next call.
+                    self.partial = false;
+                    Ok(Some(result))
+                }
+                None => {
+                    // combine consumed the buffer without completing a value and
+                    // retained partial state; defer to combine until it finishes.
+                    self.partial = true;
+                    Ok(None)
+                }
             }
         }
     }
@@ -472,6 +624,11 @@ impl Parser {
 /// This is the most straightforward way to parse something into a low
 /// level redis value instead of having to use a whole parser.
 pub fn parse_redis_value(bytes: &[u8]) -> RedisResult<Value> {
+    // EXP-001 fast path: a complete slice is the ideal case for the hand-written
+    // decoder. Fall back to `combine` for unsupported types / malformed input.
+    if let Some((value, _consumed)) = fast_parse_value(bytes) {
+        return Ok(value);
+    }
     let mut parser = Parser::new();
     parser.parse_value(bytes)
 }
