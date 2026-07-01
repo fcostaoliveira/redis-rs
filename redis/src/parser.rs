@@ -639,6 +639,27 @@ mod tests {
     use crate::errors::ErrorKind;
     use assert_matches::assert_matches;
 
+    /// EXP-001 differential fuzz: on ANY byte input, whenever the fast path
+    /// claims a value (`Some`), the canonical `combine` parser must produce the
+    /// same value from the same bytes. This is the core safety property — the
+    /// fast path must never accept (or transform) something `combine` wouldn't.
+    #[test]
+    fn fast_path_never_diverges_from_combine_fuzz() {
+        fn prop(data: Vec<u8>) -> bool {
+            match fast_parse_value(&data) {
+                // combine must agree on the same value it accepted.
+                Some((v, _)) => {
+                    matches!(Parser::new().parse_value(&data[..]), Ok(cv) if cv == v)
+                }
+                // Declined → the caller falls back to combine; nothing to check.
+                None => true,
+            }
+        }
+        quickcheck::QuickCheck::new()
+            .tests(50_000)
+            .quickcheck(prop as fn(Vec<u8>) -> bool);
+    }
+
     /// EXP-001: the fast path must agree with the `combine` grammar on every
     /// input it claims (`Some`), and must decline (`None`) unsupported RESP3
     /// types so `combine` handles them. Guards against the fast path silently
