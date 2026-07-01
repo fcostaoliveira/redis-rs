@@ -111,6 +111,21 @@ fn read_line(buf: &[u8], pos: usize) -> Option<(&[u8], usize)> {
     Some((&buf[pos..cr], cr + 2))
 }
 
+/// Parse `len` consecutive RESP values starting at `pos` (shared by array / set
+/// / map). Returns the values and the position past the last one.
+fn fast_parse_seq(buf: &[u8], pos: usize, len: usize, depth: usize) -> Option<(Vec<Value>, usize)> {
+    // Cap the pre-allocation so a bogus length can't trigger a huge up-front
+    // allocation; the real bound is the buffer contents.
+    let mut out = Vec::with_capacity(len.min(1024));
+    let mut cur = pos;
+    for _ in 0..len {
+        let (v, next) = fast_parse_at(buf, cur, depth + 1)?;
+        out.push(v);
+        cur = next;
+    }
+    Some((out, cur))
+}
+
 /// Parse one RESP value from `buf` starting at `pos`. Returns `(value, new_pos)`
 /// on success. `depth` guards against unbounded recursion, matching the
 /// `combine` grammar's `MAX_RECURSE_DEPTH` behavior (fall back on excess).
@@ -176,17 +191,53 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             if len < 0 {
                 return Some((Value::Nil, np));
             }
-            let len = len as usize;
-            // Cap the pre-allocation so a bogus length can't trigger a huge
-            // up-front allocation; the real bound is the buffer contents.
-            let mut out = Vec::with_capacity(len.min(1024));
-            let mut cur = np;
-            for _ in 0..len {
-                let (v, next) = fast_parse_at(buf, cur, depth + 1)?;
-                out.push(v);
-                cur = next;
+            let (items, cur) = fast_parse_seq(buf, np, len as usize, depth)?;
+            Some((Value::Array(items), cur))
+        }
+        b'~' => {
+            // RESP3 set — identical shape to an array.
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let len = s.trim().parse::<i64>().ok()?;
+            if len < 0 {
+                return Some((Value::Nil, np));
             }
-            Some((Value::Array(out), cur))
+            let (items, cur) = fast_parse_seq(buf, np, len as usize, depth)?;
+            Some((Value::Set(items), cur))
+        }
+        b'%' => {
+            // RESP3 map — `kv_length` pairs, i.e. 2*kv_length flat values.
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let kv_length = s.trim().parse::<i64>().ok()?;
+            // Match combine: cast to usize (wrapping for negatives) then *2 with
+            // overflow check; on overflow combine errors, so we decline.
+            let length = (kv_length as usize).checked_mul(2)?;
+            let (flat, cur) = fast_parse_seq(buf, np, length, depth)?;
+            let mut it = flat.into_iter();
+            let mut pairs = Vec::with_capacity(it.len() / 2);
+            while let (Some(k), Some(v)) = (it.next(), it.next()) {
+                pairs.push((k, v));
+            }
+            Some((Value::Map(pairs), cur))
+        }
+        b',' => {
+            // RESP3 double — trimmed, parsed as f64 (handles inf/-inf/nan like combine).
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let d = s.trim().parse::<f64>().ok()?;
+            Some((Value::Double(d), np))
+        }
+        b'#' => {
+            // RESP3 boolean — combine matches the raw line (no trim): "t" / "f".
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let b = match s {
+                "t" => true,
+                "f" => false,
+                _ => return None,
+            };
+            Some((Value::Boolean(b), np))
         }
         _ => None, // unsupported RESP3 type → fall back to combine
     }
@@ -730,6 +781,17 @@ mod tests {
             b"*-1\r\n",
             b"*0\r\n",
             b"*2\r\n*1\r\n:1\r\n$1\r\na\r\n",
+            // RESP3 types now handled by the fast path:
+            b"%2\r\n+first\r\n:1\r\n+second\r\n:2\r\n", // map
+            b"%0\r\n",                                  // empty map
+            b"~2\r\n:1\r\n:2\r\n",                      // set
+            b"~0\r\n",                                  // empty set
+            b",3.14\r\n",                               // double
+            b",inf\r\n",
+            b",-inf\r\n",
+            b"#t\r\n", // boolean
+            b"#f\r\n",
+            b"*2\r\n%1\r\n+k\r\n,1.5\r\n~1\r\n#t\r\n", // nested mix
         ];
         for input in supported {
             let fast = fast_parse_value(input).map(|(v, _)| v);
@@ -741,15 +803,13 @@ mod tests {
             assert!(fast.is_some(), "fast path should handle {input:?}");
         }
 
-        // Unsupported RESP3 types: the fast path must decline so combine parses
-        // them (and still produce the same value via parse_redis_value).
+        // Still-unsupported RESP3 types: the fast path must decline so combine
+        // parses them (and still produce the same value via parse_redis_value).
         let deferred: &[&[u8]] = &[
-            b"%1\r\n+a\r\n:1\r\n",
-            b"~2\r\n:1\r\n:2\r\n",
-            b",3.14\r\n",
-            b"#t\r\n",
-            b"(12345\r\n",
-            b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n",
+            b"(12345\r\n",                         // big number
+            b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n", // push
+            b"!5\r\nerror\r\n",                    // blob error
+            b"=15\r\ntxt:some string\r\n",         // verbatim string
         ];
         for input in deferred {
             assert!(
