@@ -284,6 +284,17 @@ fn bench_decode(c: &mut Criterion) {
         assert!(redis::parse_redis_value(&input).is_ok());
         group.bench_function("decode_resp3_map", move |b| bench_decode_simple(b, &input));
     }
+    // A RESP3 push reply (client-side-caching invalidation of 64 keys):
+    // `>2\r\n$10\r\ninvalidate\r\n*64\r\n<64 bulk keys>`.
+    {
+        let mut input = Vec::new();
+        input.extend_from_slice(b">2\r\n$10\r\ninvalidate\r\n*64\r\n");
+        for i in 0..64 {
+            input.extend_from_slice(format!("$8\r\nkey:{i:04}\r\n").as_bytes());
+        }
+        assert!(redis::parse_redis_value(&input).is_ok());
+        group.bench_function("decode_resp3_push", move |b| bench_decode_simple(b, &input));
+    }
     group.finish();
 }
 

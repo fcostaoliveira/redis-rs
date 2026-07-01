@@ -78,11 +78,11 @@ pub fn get_push_kind(kind: String) -> PushKind {
 // in the buffer — it is pure overhead.
 //
 // `fast_parse_value` decodes one complete RESP value directly from a byte
-// slice for the high-frequency types (`+ - : $ * _`). It returns
+// slice for all the common types (`+ - : $ * _ % ~ , # ! = >`). It returns
 // `Some((value, consumed))` ONLY when it fully parses a supported, well-formed
 // value with semantics identical to the `combine` grammar below. For anything
-// else — an incomplete buffer, an unsupported RESP3 type (`% ~ | , # ! = ( >`),
-// or malformed input — it returns `None`, and the caller falls back to the
+// else — an incomplete buffer, a still-unsupported RESP3 type (big number `(`,
+// attribute `|`), or malformed input — it returns `None`, and the caller falls back to the
 // `combine` parser, which remains the single source of truth for correctness
 // and error reporting. This keeps the fast path a pure accelerator that can
 // only ever agree with `combine`, never diverge from it.
@@ -124,6 +124,25 @@ fn fast_parse_seq(buf: &[u8], pos: usize, len: usize, depth: usize) -> Option<(V
         cur = next;
     }
     Some((out, cur))
+}
+
+/// Parse a length-prefixed blob (`$size\r\n<size bytes>\r\n`) starting at `pos`,
+/// decoding the payload lossily like `combine`'s `blob()`. Shared by verbatim
+/// strings and blob errors. Returns the decoded string and the position past
+/// the trailing CRLF.
+fn fast_parse_blob(buf: &[u8], pos: usize) -> Option<(String, usize)> {
+    let (line, np) = read_line(buf, pos)?;
+    let s = str::from_utf8(line).ok()?;
+    let size = s.trim().parse::<i64>().ok()?;
+    let size = size as usize; // negatives wrap huge → treated as incomplete below
+    let end = np.checked_add(size)?;
+    if end + 2 > buf.len() {
+        return None;
+    }
+    if &buf[end..end + 2] != b"\r\n" {
+        return None;
+    }
+    Some((String::from_utf8_lossy(&buf[np..end]).into_owned(), end + 2))
 }
 
 /// Parse one RESP value from `buf` starting at `pos`. Returns `(value, new_pos)`
@@ -238,6 +257,59 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
                 _ => return None,
             };
             Some((Value::Boolean(b), np))
+        }
+        b'!' => {
+            // RESP3 blob error — a blob whose text is parsed like an error line.
+            let (s, np) = fast_parse_blob(buf, body)?;
+            Some((Value::ServerError(err_parser(&s)), np))
+        }
+        b'=' => {
+            // RESP3 verbatim string — a blob of the form `fmt:text`.
+            let (s, np) = fast_parse_blob(buf, body)?;
+            let (format, text) = s.split_once(':')?; // no ':' → combine errors, so decline
+            let format = match format {
+                "txt" => VerbatimFormat::Text,
+                "mkd" => VerbatimFormat::Markdown,
+                other => VerbatimFormat::Unknown(other.to_string()),
+            };
+            Some((
+                Value::VerbatimString {
+                    format,
+                    text: text.to_string(),
+                },
+                np,
+            ))
+        }
+        b'>' => {
+            // RESP3 push — an array whose first element names the push kind.
+            let (line, np) = read_line(buf, body)?;
+            let s = str::from_utf8(line).ok()?;
+            let length = s.trim().parse::<i64>().ok()?;
+            if length <= 0 {
+                return Some((
+                    Value::Push {
+                        kind: PushKind::Other(String::new()),
+                        data: vec![],
+                    },
+                    np,
+                ));
+            }
+            let (items, cur) = fast_parse_seq(buf, np, length as usize, depth)?;
+            let mut it = items.into_iter();
+            let first = it.next().unwrap_or(Value::Nil);
+            let kind = match first {
+                // from_utf8 can fail → combine errors, so decline.
+                Value::BulkString(k) => get_push_kind(String::from_utf8(k).ok()?),
+                Value::SimpleString(k) => get_push_kind(k),
+                _ => return None, // combine errors on a non-string kind
+            };
+            Some((
+                Value::Push {
+                    kind,
+                    data: it.collect(),
+                },
+                cur,
+            ))
         }
         _ => None, // unsupported RESP3 type → fall back to combine
     }
@@ -792,6 +864,12 @@ mod tests {
             b"#t\r\n", // boolean
             b"#f\r\n",
             b"*2\r\n%1\r\n+k\r\n,1.5\r\n~1\r\n#t\r\n", // nested mix
+            b"!5\r\nabcde\r\n",                        // blob error
+            b"!21\r\nSYNTAX invalid syntax\r\n",
+            b"=15\r\ntxt:some string\r\n", // verbatim
+            b"=8\r\nmkd:# hi\r\n",
+            b">3\r\n$7\r\nmessage\r\n$3\r\nfoo\r\n$3\r\nbar\r\n", // push
+            b">0\r\n",                                            // empty push
         ];
         for input in supported {
             let fast = fast_parse_value(input).map(|(v, _)| v);
@@ -806,10 +884,8 @@ mod tests {
         // Still-unsupported RESP3 types: the fast path must decline so combine
         // parses them (and still produce the same value via parse_redis_value).
         let deferred: &[&[u8]] = &[
-            b"(12345\r\n",                         // big number
-            b">2\r\n$7\r\nmessage\r\n$1\r\nx\r\n", // push
-            b"!5\r\nerror\r\n",                    // blob error
-            b"=15\r\ntxt:some string\r\n",         // verbatim string
+            b"(12345\r\n",               // big number
+            b"|1\r\n+k\r\n+v\r\n:1\r\n", // attribute
         ];
         for input in deferred {
             assert!(
