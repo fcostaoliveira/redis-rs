@@ -132,10 +132,14 @@ fn fast_parse_seq(buf: &[u8], pos: usize, len: usize, depth: usize) -> Option<(V
 fn fast_parse_blob(buf: &[u8], pos: usize) -> Option<(String, usize)> {
     let (line, np) = read_line(buf, pos)?;
     let s = str::from_utf8(line).ok()?;
-    let size = s.trim().parse::<i64>().ok()?;
-    let size = size as usize; // negatives wrap huge → treated as incomplete below
+    // A negative size isn't a valid blob length; decline so combine handles it
+    // (its `take(size as usize)` treats it as needing ~usize::MAX bytes, i.e.
+    // incomplete). Using `try_from` (not `as usize`) also keeps `end` from
+    // wrapping near usize::MAX and overflowing the bounds check below.
+    let size = usize::try_from(s.trim().parse::<i64>().ok()?).ok()?;
     let end = np.checked_add(size)?;
-    if end + 2 > buf.len() {
+    // Need `size` payload bytes plus the trailing CRLF — overflow-safe.
+    if buf.len().checked_sub(end).is_none_or(|rem| rem < 2) {
         return None;
     }
     if &buf[end..end + 2] != b"\r\n" {
@@ -828,6 +832,33 @@ mod tests {
     use super::*;
     use crate::errors::ErrorKind;
     use assert_matches::assert_matches;
+
+    /// Regression: a negative-size blob (`!`/`=`) must not overflow the bounds
+    /// check (was a debug panic / release OOB). It must decline to `combine`,
+    /// and `parse_redis_value` must agree with pure `combine`. Found by the
+    /// differential AFL fuzz.
+    #[test]
+    fn negative_blob_size_does_not_overflow() {
+        for input in [
+            &b"!-7\r\nmessage\r\n"[..],
+            &b"=-5\r\ntxt:hi\r\n"[..],
+            &b"!-9223372036854775808\r\nx\r\n"[..],
+            &b"=-1\r\n\r\n"[..],
+        ] {
+            let fast = fast_parse_value(input); // must not panic
+            let via_public = parse_redis_value(input);
+            let via_combine = Parser::new().parse_value(input);
+            assert!(
+                fast.is_none(),
+                "fast path should decline negative blob size {input:?}"
+            );
+            assert_eq!(
+                via_public.is_ok(),
+                via_combine.is_ok(),
+                "disposition disagrees with combine on {input:?}"
+            );
+        }
+    }
 
     /// Differential fuzz. `parse_redis_value` (fast path + combine
     /// fallback) must be observationally identical to pure `combine` on ANY
