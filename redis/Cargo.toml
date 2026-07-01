@@ -316,3 +316,7 @@ required-features = ["tokio-comp", "cache-aio"]
 [[example]]
 name = "latency-aware-routing"
 required-features = ["cluster-async", "tokio-comp"]
+
+[[example]]
+name = "profile_tls_get_async"
+required-features = ["tokio-rustls-comp", "cluster"]
