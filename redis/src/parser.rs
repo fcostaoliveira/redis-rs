@@ -143,8 +143,12 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             Some((Value::Int(n), np))
         }
         b'_' => {
-            // RESP3 null: content is ignored, only the line terminator matters.
-            let (_line, np) = read_line(buf, body)?;
+            // RESP3 null. combine's `null()` runs through the same UTF-8-validating
+            // `line()` as every other type, so a non-UTF-8 body is rejected there;
+            // validate here too (else the fast path would accept `_\xff\r\n` as Nil
+            // while combine errors). The content is otherwise ignored.
+            let (line, np) = read_line(buf, body)?;
+            str::from_utf8(line).ok()?;
             Some((Value::Nil, np))
         }
         b'$' => {
@@ -508,6 +512,11 @@ mod aio_support {
                 match combine::stream::decode_tokio(value(None), &mut stream, &mut self.state) {
                     Ok(x) => x,
                     Err(err) => {
+                        // A parse error tears down the connection today, but reset
+                        // the flag anyway so the fast-path invariant (partial ⇔
+                        // combine holds live state) is self-enforcing rather than
+                        // relying on the caller not reusing the codec.
+                        self.partial = false;
                         let err = err
                             .map_position(|pos| pos.translate_position(buffer))
                             .map_range(|range| format!("{range:?}"))
@@ -639,25 +648,53 @@ mod tests {
     use crate::errors::ErrorKind;
     use assert_matches::assert_matches;
 
-    /// EXP-001 differential fuzz: on ANY byte input, whenever the fast path
-    /// claims a value (`Some`), the canonical `combine` parser must produce the
-    /// same value from the same bytes. This is the core safety property — the
-    /// fast path must never accept (or transform) something `combine` wouldn't.
+    /// EXP-001 differential fuzz. `parse_redis_value` (fast path + combine
+    /// fallback) must be observationally identical to pure `combine` on ANY
+    /// input — same value on success, and error ⇔ error. This catches the fast
+    /// path accepting something combine rejects (e.g. a non-UTF-8 `_` null line),
+    /// not just value mismatches.
+    ///
+    /// Inputs are biased toward RESP shapes (leading marker + short, possibly
+    /// non-UTF-8 body + optional CRLF) so the fast path's type arms and their
+    /// edge cases are actually exercised — plain random bytes almost never form
+    /// a parseable frame.
+    #[derive(Clone, Debug)]
+    struct RespishBytes(Vec<u8>);
+
+    impl quickcheck::Arbitrary for RespishBytes {
+        fn arbitrary(g: &mut quickcheck::Gen) -> Self {
+            use quickcheck::Arbitrary;
+            const MARKERS: &[u8] = b"+-:$*_%~,#!=(>";
+            let mut out = Vec::new();
+            let lines = (usize::arbitrary(g) % 4) + 1;
+            for _ in 0..lines {
+                out.push(*g.choose(MARKERS).unwrap());
+                for _ in 0..(usize::arbitrary(g) % 6) {
+                    out.push(u8::arbitrary(g));
+                }
+                if bool::arbitrary(g) {
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+            RespishBytes(out)
+        }
+    }
+
     #[test]
     fn fast_path_never_diverges_from_combine_fuzz() {
-        fn prop(data: Vec<u8>) -> bool {
-            match fast_parse_value(&data) {
-                // combine must agree on the same value it accepted.
-                Some((v, _)) => {
-                    matches!(Parser::new().parse_value(&data[..]), Ok(cv) if cv == v)
-                }
-                // Declined → the caller falls back to combine; nothing to check.
-                None => true,
+        fn prop(input: RespishBytes) -> bool {
+            let data = &input.0;
+            let via_fast = parse_redis_value(data); // fast path + combine fallback
+            let via_combine = Parser::new().parse_value(&data[..]); // pure combine
+            match (via_fast, via_combine) {
+                (Ok(a), Ok(b)) => a == b,
+                (Err(_), Err(_)) => true,
+                _ => false, // one accepted, one rejected → divergence
             }
         }
         quickcheck::QuickCheck::new()
-            .tests(50_000)
-            .quickcheck(prop as fn(Vec<u8>) -> bool);
+            .tests(100_000)
+            .quickcheck(prop as fn(RespishBytes) -> bool);
     }
 
     /// EXP-001: the fast path must agree with the `combine` grammar on every
@@ -724,6 +761,75 @@ mod tests {
                 fast_parse_value(input).is_none(),
                 "fast path should decline incomplete {input:?}"
             );
+        }
+
+        // Malformed line bodies: combine validates UTF-8 in `line()` for every
+        // line-based type, so a non-UTF-8 body must be *rejected*. The fast path
+        // must decline (→ combine errors), never accept it as a value. Regression
+        // for the `_` null arm, which originally skipped this check.
+        let non_utf8: &[&[u8]] = &[
+            b"_\xff\r\n",
+            b"+\xff\r\n",
+            b":\xff\r\n",
+            b"-\xff\r\n",
+            b"$\xff\r\n",
+            b"*\xff\r\n",
+        ];
+        for input in non_utf8 {
+            assert!(
+                fast_parse_value(input).is_none(),
+                "fast path must decline non-utf8 line {input:?}"
+            );
+            assert!(
+                Parser::new().parse_value(&input[..]).is_err(),
+                "combine rejects non-utf8 line {input:?} (so the fast path must too)"
+            );
+        }
+    }
+
+    /// EXP-001: exercise the async `ValueCodec` fast-path ↔ combine-partial
+    /// interleaving across EVERY chunk boundary. At chunk size == wire length
+    /// every frame is fully buffered (fast path handles all); at chunk size 1
+    /// every frame arrives a byte at a time (combine partial-resume handles all);
+    /// sizes in between mix the two. In all cases the decoded sequence must match
+    /// exactly and no bytes may be stranded — i.e. no drop, duplicate, or
+    /// stranded `partial`/`state`.
+    #[cfg(feature = "aio")]
+    #[test]
+    fn codec_fast_path_and_partial_interleave() {
+        use bytes::BytesMut;
+        use tokio_util::codec::Decoder;
+
+        let wire: &[u8] =
+            b"$5\r\nhello\r\n+OK\r\n:42\r\n*2\r\n:1\r\n:2\r\n_\r\n$-1\r\n-ERR boom\r\n";
+        let expected = vec![
+            Value::BulkString(b"hello".to_vec()),
+            Value::Okay,
+            Value::Int(42),
+            Value::Array(vec![Value::Int(1), Value::Int(2)]),
+            Value::Nil,
+            Value::Nil,
+            Value::ServerError(err_parser("ERR boom")),
+        ];
+
+        for chunk in 1..=wire.len() {
+            let mut codec = ValueCodec::default();
+            let mut buf = BytesMut::new();
+            let mut got = Vec::new();
+            for piece in wire.chunks(chunk) {
+                buf.extend_from_slice(piece);
+                while let Some(v) = codec.decode(&mut buf).unwrap() {
+                    got.push(v);
+                }
+            }
+            while let Some(v) = codec.decode_eof(&mut buf).unwrap() {
+                got.push(v);
+            }
+            assert_eq!(
+                got, expected,
+                "decoded sequence mismatch at chunk size {chunk}"
+            );
+            assert!(buf.is_empty(), "stranded bytes at chunk size {chunk}");
         }
     }
 
