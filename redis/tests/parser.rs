@@ -199,7 +199,7 @@ quickcheck! {
 }
 
 quickcheck! {
-    // EXP-001 differential fuzz (structured): `parse_redis_value` routes through
+    // Differential fuzz (structured): `parse_redis_value` routes through
     // the hand-written fast path first. For every arbitrary RESP value tree it
     // must reproduce the original value exactly — i.e. the fast path agrees with
     // the ground truth on the whole supported grammar under randomized input.

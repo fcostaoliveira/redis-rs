@@ -69,11 +69,11 @@ pub fn get_push_kind(kind: String) -> PushKind {
 }
 
 // ---------------------------------------------------------------------------
-// EXP-001: hand-written RESP fast-path decoder.
+// Hand-written RESP fast-path decoder.
 //
-// The profile (experiments/EXP-000-baseline/PROFILE.md) showed ~60% of the
-// client CPU is spent inside `combine`'s partial-state parser-combinator
-// machinery. That machinery exists to resume a parse across a buffer boundary,
+// Profiling the client read path showed most of the CPU spent inside `combine`'s
+// partial-state parser-combinator machinery. That machinery exists to resume a
+// parse across a buffer boundary,
 // but for the overwhelmingly common case — a *complete* reply already sitting
 // in the buffer — it is pure overhead.
 //
@@ -488,7 +488,7 @@ mod aio_support {
     #[derive(Default)]
     pub struct ValueCodec {
         state: AnySendSyncPartialState,
-        // EXP-001: true while `combine` holds partial state from an earlier
+        // true while `combine` holds partial state from an earlier
         // incomplete decode. The fast path is only tried when this is false, so
         // a fast-path success can never be interleaved into a `combine`
         // resume-across-reads sequence (which would strand `state`).
@@ -633,7 +633,7 @@ impl Parser {
 /// This is the most straightforward way to parse something into a low
 /// level redis value instead of having to use a whole parser.
 pub fn parse_redis_value(bytes: &[u8]) -> RedisResult<Value> {
-    // EXP-001 fast path: a complete slice is the ideal case for the hand-written
+    // Fast path: a complete slice is the ideal case for the hand-written
     // decoder. Fall back to `combine` for unsupported types / malformed input.
     if let Some((value, _consumed)) = fast_parse_value(bytes) {
         return Ok(value);
@@ -648,7 +648,7 @@ mod tests {
     use crate::errors::ErrorKind;
     use assert_matches::assert_matches;
 
-    /// EXP-001 differential fuzz. `parse_redis_value` (fast path + combine
+    /// Differential fuzz. `parse_redis_value` (fast path + combine
     /// fallback) must be observationally identical to pure `combine` on ANY
     /// input — same value on success, and error ⇔ error. This catches the fast
     /// path accepting something combine rejects (e.g. a non-UTF-8 `_` null line),
@@ -697,7 +697,7 @@ mod tests {
             .quickcheck(prop as fn(RespishBytes) -> bool);
     }
 
-    /// EXP-001: the fast path must agree with the `combine` grammar on every
+    /// The fast path must agree with the `combine` grammar on every
     /// input it claims (`Some`), and must decline (`None`) unsupported RESP3
     /// types so `combine` handles them. Guards against the fast path silently
     /// diverging from the canonical parser.
@@ -787,7 +787,7 @@ mod tests {
         }
     }
 
-    /// EXP-001: exercise the async `ValueCodec` fast-path ↔ combine-partial
+    /// Exercise the async `ValueCodec` fast-path ↔ combine-partial
     /// interleaving across EVERY chunk boundary. At chunk size == wire length
     /// every frame is fully buffered (fast path handles all); at chunk size 1
     /// every frame arrives a byte at a time (combine partial-resume handles all);
