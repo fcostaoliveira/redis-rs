@@ -195,6 +195,15 @@ test-macros = { path = "../test-macros" }
 assert_matches = "1.5.0"
 env_logger = "0.11.10"
 
+# Sudo-free sampling profiler for the profile_tls_get example (signal-based, no
+# perf_event access required). Linux/macOS only.
+[target.'cfg(unix)'.dev-dependencies]
+pprof = { version = "0.14", features = ["flamegraph"] }
+
+[[example]]
+name = "profile_tls_get"
+required-features = ["tokio-rustls-comp", "cluster"]
+
 [[test]]
 name = "test_async"
 required-features = ["tokio-comp"]
