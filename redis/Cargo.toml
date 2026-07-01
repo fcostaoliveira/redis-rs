@@ -252,6 +252,11 @@ name = "bench_cache"
 harness = false
 required-features = ["tokio-comp", "cache-aio"]
 
+[[bench]]
+name = "bench_tls"
+harness = false
+required-features = ["tokio-rustls-comp", "cluster"]
+
 [[example]]
 name = "async-multiplexed"
 required-features = ["tokio-comp"]
