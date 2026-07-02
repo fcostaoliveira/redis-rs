@@ -309,6 +309,24 @@ fn bench_decode(c: &mut Criterion) {
             bench_decode_simple(b, &input)
         });
     }
+    // A `COMMAND` reply: an array of per-command entries, each a deeply-nested
+    // array (name, arity, flags[], first/last/step keys, acl-cats[], tips[],
+    // key-specs[], subcommands[]). The largest, most nested reply a client meets;
+    // exercises the recursive array fast-path. 200 entries approximates a server.
+    {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"*200\r\n");
+        for i in 0..200 {
+            // 10-element entry: name, arity, 3 flags, 3 ints, empty acl/tips, empty specs.
+            input.extend_from_slice(b"*10\r\n");
+            input.extend_from_slice(format!("$7\r\ncmd{i:04}\r\n:2\r\n").as_bytes());
+            input.extend_from_slice(b"*3\r\n+write\r\n+denyoom\r\n+fast\r\n");
+            input.extend_from_slice(b":1\r\n:1\r\n:1\r\n");
+            input.extend_from_slice(b"*2\r\n+@write\r\n+@fast\r\n*0\r\n*0\r\n*0\r\n");
+        }
+        assert!(redis::parse_redis_value(&input).is_ok());
+        group.bench_function("decode_command", move |b| bench_decode_simple(b, &input));
+    }
     group.finish();
 }
 
