@@ -151,21 +151,16 @@ pub async fn transaction_async<
 
         let mut pipeline = pipe();
         pipeline.atomic();
-        // On the retry path (`Ok(None)`) no UNWATCH round-trip is needed: a real
-        // EXEC abort already cleared the watch server-side, and a closure that
-        // returned without executing is re-WATCHed on the next iteration. UNWATCH
-        // is only the best-effort safety net for the *terminal* paths, where the
-        // closure may have returned without ever reaching EXEC.
-        match func(connection.clone(), pipeline).await {
-            Ok(Some(result)) => {
-                let _ = cmd("UNWATCH").exec_async(&mut connection).await;
-                return Ok(result);
-            }
-            Ok(None) => continue,
-            Err(err) => {
-                let _ = cmd("UNWATCH").exec_async(&mut connection).await;
-                return Err(err);
-            }
+        let response = func(connection.clone(), pipeline).await;
+        // Send UNWATCH as a best-effort safety net for any edge cases where EXEC
+        // was not reached (e.g. the closure returned None before calling query_async).
+        // NB: this per-iteration UNWATCH is *not* purely a redundant cleanup — it
+        // also clears the connection's CLIENT_DIRTY_CAS flag between retries, which
+        // a plain re-WATCH does not (verified against redis: re-WATCH keeps a key
+        // dirtied by a prior direct write, so a later EXEC would spuriously abort).
+        let _ = cmd("UNWATCH").exec_async(&mut connection).await;
+        if let Some(result) = response? {
+            return Ok(result);
         }
     }
 }
