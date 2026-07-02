@@ -110,12 +110,22 @@ fn read_line(buf: &[u8], pos: usize) -> Option<(&[u8], usize)> {
     Some((&buf[pos..cr], cr + 2))
 }
 
+/// Pre-allocation size for a sequence of `len` elements, each occupying at
+/// least `min_elem_bytes` in the buffer. Bounds the up-front allocation by what
+/// `remaining` bytes could actually hold so a bogus length can't over-allocate.
+fn seq_capacity(remaining: usize, len: usize, min_elem_bytes: usize) -> usize {
+    len.min(remaining / min_elem_bytes + 1)
+}
+
 /// Parse `len` consecutive RESP values starting at `pos` (shared by array / set
 /// / map). Returns the values and the position past the last one.
 fn fast_parse_seq(buf: &[u8], pos: usize, len: usize, depth: usize) -> Option<(Vec<Value>, usize)> {
-    // Cap the pre-allocation so a bogus length can't trigger a huge up-front
-    // allocation; the real bound is the buffer contents.
-    let mut out = Vec::with_capacity(len.min(1024));
+    // Bound the pre-allocation by what the buffer can actually hold: every RESP
+    // value is at least 3 bytes (a marker plus CRLF), so `remaining / 3` is a
+    // safe upper bound on the element count. This lets a legitimate large array
+    // (e.g. a big MGET) pre-size exactly — avoiding repeated Vec re-allocations
+    // as it grows — while a bogus length still can't allocate beyond the buffer.
+    let mut out = Vec::with_capacity(seq_capacity(buf.len().saturating_sub(pos), len, 3));
     let mut cur = pos;
     for _ in 0..len {
         let (v, next) = fast_parse_at(buf, cur, depth + 1)?;
@@ -250,7 +260,8 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             let kv_length = kv_length as usize;
             kv_length.checked_mul(2)?; // decline (→ combine errors) on the same overflow
             // Build pairs directly rather than a flat Vec we then re-partition.
-            let mut pairs = Vec::with_capacity(kv_length.min(1024));
+            // Each pair is two values (≥6 bytes); bound the alloc by the buffer.
+            let mut pairs = Vec::with_capacity(seq_capacity(buf.len().saturating_sub(np), kv_length, 6));
             let mut cur = np;
             for _ in 0..kv_length {
                 let (k, next) = fast_parse_at(buf, cur, depth + 1)?;
@@ -347,7 +358,9 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             let length = kv_length.checked_mul(2)?.checked_add(1)?;
             let (items, cur) = fast_parse_seq(buf, np, length, depth)?;
             let mut it = items.into_iter();
-            let mut attributes = Vec::with_capacity(kv_length.min(1024));
+            // `kv_length` is already proven real here: `length` items were parsed
+            // from the finite buffer, so `kv_length <= items.len() / 2`.
+            let mut attributes = Vec::with_capacity(kv_length);
             for _ in 0..kv_length {
                 let k = it.next()?;
                 let v = it.next()?;

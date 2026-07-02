@@ -295,6 +295,20 @@ fn bench_decode(c: &mut Criterion) {
         assert!(redis::parse_redis_value(&input).is_ok());
         group.bench_function("decode_resp3_push", move |b| bench_decode_simple(b, &input));
     }
+    // MGET-shaped replies: a flat array of N bulk strings (16-byte values), the
+    // common large-array read path. Sized to exercise the array pre-allocation
+    // and per-element blob copy across small/large fan-outs.
+    for n in [64usize, 1000, 10000] {
+        let mut input = Vec::new();
+        input.extend_from_slice(format!("*{n}\r\n").as_bytes());
+        for i in 0..n {
+            input.extend_from_slice(format!("$16\r\nvalue:{i:010}\r\n").as_bytes());
+        }
+        assert!(redis::parse_redis_value(&input).is_ok());
+        group.bench_function(format!("decode_mget_{n}"), move |b| {
+            bench_decode_simple(b, &input)
+        });
+    }
     group.finish();
 }
 
