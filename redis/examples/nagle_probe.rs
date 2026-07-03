@@ -29,6 +29,11 @@ async fn main() -> redis::RedisResult<()> {
     let nodelay: bool = args.next().expect("nodelay").parse().unwrap();
     let tls_paths = (args.next(), args.next(), args.next());
 
+    // rustls 0.23 needs a process-wide crypto provider (same as tests/support).
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     let info = url
         .into_connection_info()?
         .set_tcp_settings(TcpSettings::default().set_nodelay(nodelay));
