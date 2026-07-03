@@ -964,6 +964,15 @@ mod tests {
             b"(3492890328409238509324850943850943825024385\r\n",  // big number
             b"|1\r\n+ttl\r\n:3600\r\n:42\r\n",                    // attribute (1 pair + data)
             b"|0\r\n+justdata\r\n",                               // attribute, no pairs
+            // Common multi-element read replies, in both protocol encodings, as
+            // explicit regression coverage that these client-facing shapes stay
+            // on the fast path:
+            b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",           // SMEMBERS/SDIFF/SUNION (RESP2 array)
+            b"~3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",           // SMEMBERS (RESP3 set)
+            b"*4\r\n$2\r\nf1\r\n$2\r\nv1\r\n$2\r\nf2\r\n$2\r\nv2\r\n", // HGETALL (RESP2 flat array)
+            b"%2\r\n$2\r\nf1\r\n$2\r\nv1\r\n$2\r\nf2\r\n$2\r\nv2\r\n", // HGETALL (RESP3 map)
+            b"*4\r\n$1\r\na\r\n$3\r\n1.5\r\n$1\r\nb\r\n$3\r\n2.5\r\n", // ZRANGE WITHSCORES (RESP2 flat, string scores)
+            b"*2\r\n*2\r\n$1\r\na\r\n,1.5\r\n*2\r\n$1\r\nb\r\n,2.5\r\n", // ZRANGE WITHSCORES (RESP3 member/double pairs)
         ];
         for input in supported {
             let fast = fast_parse_value(input).map(|(v, _)| v);
