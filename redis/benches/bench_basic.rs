@@ -214,6 +214,23 @@ fn bench_encode_integer(b: &mut Bencher) {
     });
 }
 
+fn bench_encode_set_ex(b: &mut Bencher) {
+    // `SET key val EX <secs>` — exercises the `SetExpiry` option encoder, a hot
+    // path for expiry-heavy workloads.
+    b.iter(|| {
+        let mut pipe = redis::pipe();
+
+        for _ in 0..1_000 {
+            pipe.cmd("SET")
+                .arg("session:abc123")
+                .arg("some-value")
+                .arg(redis::SetExpiry::EX(3600))
+                .ignore();
+        }
+        pipe.get_packed_pipeline()
+    });
+}
+
 fn bench_encode_pipeline(b: &mut Bencher) {
     b.iter(|| {
         let mut pipe = redis::pipe();
@@ -248,7 +265,8 @@ fn bench_encode(c: &mut Criterion) {
         .bench_function("pipeline", bench_encode_pipeline)
         .bench_function("pipeline_nested", bench_encode_pipeline_nested)
         .bench_function("integer", bench_encode_integer)
-        .bench_function("small", bench_encode_small);
+        .bench_function("small", bench_encode_small)
+        .bench_function("set_ex", bench_encode_set_ex);
     group.finish();
 }
 
@@ -326,6 +344,44 @@ fn bench_decode(c: &mut Criterion) {
         }
         assert!(redis::parse_redis_value(&input).is_ok());
         group.bench_function("decode_command", move |b| bench_decode_simple(b, &input));
+    }
+    // Workload-shaped set/hash/zset read replies (RESP2 array forms), the common
+    // multi-element read path (SMEMBERS/SRANDMEMBER/SDIFF/SUNION, HGETALL, ZRANGE
+    // WITHSCORES). Per-element bulk strings — the shape whose materialization cost
+    // the parser fast-path structures and a zero-copy `Bytes` rebuild will target.
+    {
+        // A set reply: 100 members ("member:" + 9 digits = 16-byte bulk strings).
+        let mut input = Vec::new();
+        input.extend_from_slice(b"*100\r\n");
+        for i in 0..100 {
+            input.extend_from_slice(format!("$16\r\nmember:{i:09}\r\n").as_bytes());
+        }
+        assert!(redis::parse_redis_value(&input).is_ok());
+        group.bench_function("decode_set_members", move |b| bench_decode_simple(b, &input));
+    }
+    {
+        // HGETALL, RESP2 flat array: 32 field/value pairs = 64 bulk strings.
+        // "field" + 3 digits = 8 bytes; "value:" + 4 digits = 10 bytes.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"*64\r\n");
+        for i in 0..32 {
+            input.extend_from_slice(format!("$8\r\nfield{i:03}\r\n$10\r\nvalue:{i:04}\r\n").as_bytes());
+        }
+        assert!(redis::parse_redis_value(&input).is_ok());
+        group.bench_function("decode_hgetall_resp2", move |b| bench_decode_simple(b, &input));
+    }
+    {
+        // ZRANGE WITHSCORES, RESP2 flat array: 64 member/score pairs = 128
+        // elements. "member:" + 4 digits = 11 bytes; score "1.500000" = 8 bytes.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"*128\r\n");
+        for i in 0..64 {
+            input.extend_from_slice(format!("$11\r\nmember:{i:04}\r\n$8\r\n1.500000\r\n").as_bytes());
+        }
+        assert!(redis::parse_redis_value(&input).is_ok());
+        group.bench_function("decode_zrange_withscores_resp2", move |b| {
+            bench_decode_simple(b, &input)
+        });
     }
     group.finish();
 }
