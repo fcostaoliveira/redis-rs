@@ -110,6 +110,41 @@ fn read_line(buf: &[u8], pos: usize) -> Option<(&[u8], usize)> {
     Some((&buf[pos..cr], cr + 2))
 }
 
+/// Parse a header line as an integer, accepting only the canonical wire form
+/// `-?[0-9]+` (what a redis server actually sends for `:` replies and length
+/// prefixes). Anything else — whitespace, a leading `+`, empty, non-digits,
+/// overflow — returns `None` and the caller falls back to `combine`, which
+/// accepts exactly what it always did. This skips the UTF-8 validation, `trim`,
+/// and generic `str::parse` machinery on the hottest per-reply lines.
+///
+/// Accumulates negatively so `i64::MIN` (which has no positive counterpart)
+/// stays representable; on overflow it declines rather than wrapping.
+#[inline]
+fn parse_wire_i64(line: &[u8]) -> Option<i64> {
+    let (neg, digits) = match line.split_first()? {
+        (b'-', rest) => (true, rest),
+        _ => (false, line),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut n: i64 = 0;
+    for &b in digits {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_sub(i64::from(b - b'0'))?;
+    }
+    if neg { Some(n) } else { n.checked_neg() }
+}
+
+/// Read a `\r\n`-terminated line at `pos` and parse it with [`parse_wire_i64`].
+#[inline]
+fn read_wire_int(buf: &[u8], pos: usize) -> Option<(i64, usize)> {
+    let (line, np) = read_line(buf, pos)?;
+    Some((parse_wire_i64(line)?, np))
+}
+
 /// Pre-allocation size for a sequence of `len` elements, each occupying at
 /// least `min_elem_bytes` in the buffer. Bounds the up-front allocation by what
 /// `remaining` bytes could actually hold so a bogus length can't over-allocate.
@@ -140,13 +175,12 @@ fn fast_parse_seq(buf: &[u8], pos: usize, len: usize, depth: usize) -> Option<(V
 /// strings and blob errors. Returns the decoded string and the position past
 /// the trailing CRLF.
 fn fast_parse_blob(buf: &[u8], pos: usize) -> Option<(String, usize)> {
-    let (line, np) = read_line(buf, pos)?;
-    let s = str::from_utf8(line).ok()?;
+    let (size, np) = read_wire_int(buf, pos)?;
     // A negative size isn't a valid blob length; decline so combine handles it
     // (its `take(size as usize)` treats it as needing ~usize::MAX bytes, i.e.
     // incomplete). Using `try_from` (not `as usize`) also keeps `end` from
     // wrapping near usize::MAX and overflowing the bounds check below.
-    let size = usize::try_from(s.trim().parse::<i64>().ok()?).ok()?;
+    let size = usize::try_from(size).ok()?;
     let end = np.checked_add(size)?;
     // Need `size` payload bytes plus the trailing CRLF — overflow-safe.
     if buf.len().checked_sub(end).is_none_or(|rem| rem < 2) {
@@ -197,9 +231,7 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             Some((Value::ServerError(err_parser(s)), np))
         }
         b':' => {
-            let (line, np) = read_line(buf, body)?;
-            let s = str::from_utf8(line).ok()?;
-            let n = s.trim().parse::<i64>().ok()?;
+            let (n, np) = read_wire_int(buf, body)?;
             Some((Value::Int(n), np))
         }
         b'_' => {
@@ -212,9 +244,7 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             Some((Value::Nil, np))
         }
         b'$' => {
-            let (line, np) = read_line(buf, body)?;
-            let s = str::from_utf8(line).ok()?;
-            let size = s.trim().parse::<i64>().ok()?;
+            let (size, np) = read_wire_int(buf, body)?;
             if size < 0 {
                 return Some((Value::Nil, np));
             }
@@ -230,9 +260,7 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
             Some((Value::BulkString(buf[np..end].to_vec()), end + 2))
         }
         b'*' => {
-            let (line, np) = read_line(buf, body)?;
-            let s = str::from_utf8(line).ok()?;
-            let len = s.trim().parse::<i64>().ok()?;
+            let (len, np) = read_wire_int(buf, body)?;
             if len < 0 {
                 return Some((Value::Nil, np));
             }
@@ -241,9 +269,7 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
         }
         b'~' => {
             // RESP3 set — identical shape to an array.
-            let (line, np) = read_line(buf, body)?;
-            let s = str::from_utf8(line).ok()?;
-            let len = s.trim().parse::<i64>().ok()?;
+            let (len, np) = read_wire_int(buf, body)?;
             if len < 0 {
                 return Some((Value::Nil, np));
             }
@@ -252,9 +278,7 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
         }
         b'%' => {
             // RESP3 map — `kv_length` (key, value) pairs.
-            let (line, np) = read_line(buf, body)?;
-            let s = str::from_utf8(line).ok()?;
-            let kv_length = s.trim().parse::<i64>().ok()?;
+            let (kv_length, np) = read_wire_int(buf, body)?;
             // Match combine: cast to usize (wrapping for negatives); combine
             // errors when kv_length*2 overflows, so decline on the same overflow.
             let kv_length = kv_length as usize;
@@ -313,9 +337,7 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
         }
         b'>' => {
             // RESP3 push — an array whose first element names the push kind.
-            let (line, np) = read_line(buf, body)?;
-            let s = str::from_utf8(line).ok()?;
-            let length = s.trim().parse::<i64>().ok()?;
+            let (length, np) = read_wire_int(buf, body)?;
             if length <= 0 {
                 return Some((
                     Value::Push {
@@ -350,9 +372,7 @@ fn fast_parse_at(buf: &[u8], pos: usize, depth: usize) -> Option<(Value, usize)>
         }
         b'|' => {
             // RESP3 attribute — `kv_length` metadata pairs followed by 1 data value.
-            let (line, np) = read_line(buf, body)?;
-            let s = str::from_utf8(line).ok()?;
-            let kv_length = s.trim().parse::<i64>().ok()?;
+            let (kv_length, np) = read_wire_int(buf, body)?;
             let kv_length = kv_length as usize;
             // combine: 2*kv_length values for the pairs, +1 for the data.
             let length = kv_length.checked_mul(2)?.checked_add(1)?;
@@ -850,6 +870,56 @@ mod tests {
     /// check (was a debug panic / release OOB). It must decline to `combine`,
     /// and `parse_redis_value` must agree with pure `combine`. Found by the
     /// differential AFL fuzz.
+    #[test]
+    fn wire_int_edge_cases_agree_with_combine() {
+        // Canonical wire integers the fast path must parse, including both
+        // extremes (i64::MIN has no positive counterpart — the negative
+        // accumulation in parse_wire_i64 exists for exactly this case).
+        let canonical: &[(&[u8], i64)] = &[
+            (b":0\r\n", 0),
+            (b":-0\r\n", 0),
+            (b":007\r\n", 7),
+            (b":9223372036854775807\r\n", i64::MAX),
+            (b":-9223372036854775808\r\n", i64::MIN),
+        ];
+        for (input, expected) in canonical {
+            let fast = fast_parse_value(input).map(|(v, _)| v);
+            assert_eq!(fast, Some(Value::Int(*expected)), "on {input:?}");
+            assert_eq!(
+                fast,
+                Parser::new().parse_value(*input).ok(),
+                "disagrees with combine on {input:?}"
+            );
+        }
+
+        // Non-canonical forms the wire parser declines. The public entry point
+        // must still produce combine's result (fallback), so the observable
+        // behavior is unchanged — only the fast path's coverage shrinks.
+        let non_canonical: &[&[u8]] = &[
+            b":+5\r\n",                     // leading plus
+            b": 5\r\n",                     // leading whitespace
+            b":5 \r\n",                     // trailing whitespace
+            b":\r\n",                       // empty
+            b":-\r\n",                      // bare sign
+            b":99999999999999999999\r\n",   // overflow (20 digits)
+            b":-99999999999999999999\r\n",  // negative overflow
+            b":12a3\r\n",                   // embedded garbage
+        ];
+        for input in non_canonical {
+            assert!(
+                fast_parse_value(input).is_none(),
+                "fast path should decline {input:?}"
+            );
+            let via_public = parse_redis_value(input);
+            let via_combine = Parser::new().parse_value(*input);
+            assert_eq!(
+                via_public.ok(),
+                via_combine.ok(),
+                "fallback disagrees with combine on {input:?}"
+            );
+        }
+    }
+
     #[test]
     fn negative_blob_size_does_not_overflow() {
         for input in [
