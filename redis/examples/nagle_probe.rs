@@ -54,10 +54,12 @@ async fn main() -> redis::RedisResult<()> {
     all.sort_unstable();
     let pct = |p: f64| all[((all.len() as f64 * p) as usize).min(all.len() - 1)];
     println!(
-        "nodelay={nodelay} tasks={tasks} ops={} | p50={}us p99={}us max={}us | {:.0} ops/s",
+        "nodelay={nodelay} tasks={tasks} ops={} | p50={}us p99={}us p999={}us p9999={}us max={}us | {:.0} ops/s",
         all.len(),
         pct(0.50),
         pct(0.99),
+        pct(0.999),
+        pct(0.9999),
         all[all.len() - 1],
         all.len() as f64 / wall.as_secs_f64(),
     );
